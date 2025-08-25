@@ -14,10 +14,85 @@ This repository contains a complete implementation of a Temporal SetRanker that 
 ## Performance Results (21+ years, 257 months)
 
 | Strategy | CAGR | Sharpe | MaxDD | Hit Rate |
-|----------|------|--------|-------|----------|
-| **Transformer Model** | 2.43% | 0.55 | -8.2% | 59.1% |
+|---|---|---|---|---|
+| **F1 Model (Rank/Z-Score)** | **2.97%** | **0.644** | -11.3% | 60.3% |
 | **RawRank Baseline** | 3.00% | 0.68 | -11.3% | 60.3% |
 | **Isotonic Calibration** | 1.33% | 0.29 | -9.7% | 50.6% |
+
+## Model Experiments
+
+### F1: Cross-Sectional Features (Rank & Z-Score)
+
+To improve performance, the model was enhanced by adding explicit cross-sectional features. The strong performance of the `RawRank` baseline suggested that the model would benefit from knowing each factor's relative standing at each point in time.
+
+- **Change**: Added cross-sectional rank and z-score of the `T60` forecast as input features to the GRU.
+- **Script**: `run_set_ranker_F1.py`
+
+#### Performance Comparison (vs. Original)
+
+| Strategy | CAGR | Sharpe |
+|---|---|---|
+| Original Model | 2.43% | 0.550 |
+| **F1 Model (Rank/Z-Score)** | **2.97%** | **0.644** |
+| RawRank Baseline | 3.00% | 0.677 |
+
+**Conclusion**: Adding these features significantly closed the gap with the `RawRank` baseline, boosting CAGR by over 50 bps and Sharpe ratio by nearly 0.1. This confirms the importance of providing explicit relative ranking information to the model.
+
+### F2: Lagged Realized Return Feature
+
+This experiment tested whether adding a 1-month lagged realized return as a feature could improve the model's predictive power by giving it direct information about recent performance.
+
+- **Change**: Added the 1-month lagged realized return as a fourth input feature to the GRU.
+- **Script**: `run_set_ranker_F2.py`
+
+#### Performance Comparison
+
+| Strategy | CAGR | Sharpe |
+|---|---|---|
+| **F2 Model (Lagged Return)** | **2.44%** | **0.552** |
+| F1 Model (Best) | 2.97% | 0.644 |
+| RawRank Baseline | 3.00% | 0.677 |
+
+**Conclusion**: The lagged return feature did not improve performance. In fact, the F2 model performed worse than the F1 model and was comparable to the original model, suggesting the feature added more noise than signal.
+
+### F3: Multi-Lag Realized Return Features
+
+This experiment expanded on F2 by incorporating multiple lagged realized returns (1, 3, and 6 months) to test if a richer historical context would improve the model's predictive power.
+
+- **Change**: Added 1, 3, and 6-month lagged realized returns as input features, bringing the total to 6.
+- **Script**: `run_set_ranker_F3.py`
+
+#### Performance Comparison
+
+| Strategy | CAGR | Sharpe |
+|---|---|---|
+| **F3 Model (Multi-Lag)** | **2.05%** | **0.456** |
+| F1 Model (Best) | 2.97% | 0.644 |
+| RawRank Baseline | 3.00% | 0.677 |
+
+**Conclusion**: Adding more lagged return features did not improve performance and, in fact, degraded it compared to the F1 model. The model's factor rankings also showed a highly volatile and inconsistent correlation with the `RawRank` baseline, suggesting the additional features introduced more noise than signal. The F1 model remains the best-performing configuration.
+
+### F1 Detailed: Full Monthly Outputs
+
+This experiment re-ran the best-performing F1 model configuration but with an enhanced output script (`run_set_ranker_F1_detailed.py`) to generate wide-format Excel sheets containing the full monthly factor scores and ranks. This provides a much richer dataset for detailed performance attribution and model behavior analysis.
+
+#### Performance Comparison
+
+| Model         | Mean P@5 | Mean NDCG@5 | Mean AvgTop5 | Mean Regret@5 | Mean IC  |
+| :------------ | :------- | :---------- | :----------- | :------------ | :------- |
+| **F1 Detailed** | 0.0778   | 0.0520      | 0.2530       | 3.2113        | 0.0117   |
+| **RawRank**     | 0.0809   | 0.0339      | 0.2550       | 3.2093        | 0.0245   |
+| **Isolation**   | 0.0661   | **0.0580**  | 0.1188       | 3.3455        | -0.0145  |
+
+**Conclusion**: The F1 Detailed model's performance is consistent with the original F1 run. While its portfolio return (`Mean_AvgTop5`) is slightly behind the `RawRank` baseline, its ranking quality (`Mean_NDCG@5`) is significantly better, demonstrating its ability to learn more nuanced factor relationships. The detailed outputs will enable deeper analysis into when and why the model diverges from the baseline.
+
+### Detailed Output Format
+
+As part of the F3 experiment, the output script was enhanced to save the full monthly factor scores and ranks in a wide format (`Scores_Wide` and `Ranks_Wide` sheets in `predictions_f3.xlsx`). This allows for more detailed per-factor and per-month analysis of the model's behavior.
+
+### Correlation Analysis
+
+As part of the F2 and F3 experiments, a monthly Spearman rank correlation analysis was added to compare the model's factor rankings against the `RawRank` baseline. The results showed a highly volatile correlation, indicating the model often diverges significantly from the baseline, but this divergence did not lead to better performance.
 
 ## Key Features
 

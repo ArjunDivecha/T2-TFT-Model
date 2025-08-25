@@ -146,11 +146,38 @@ def read_metrics_series(xlsx_path: str, sheet: str) -> pd.Series:
 def read_predictions_sheet(xlsx_path: str, sheet: str) -> Optional[pd.DataFrame]:
     try:
         df = pd.read_excel(xlsx_path, sheet_name=sheet)
-        if not {'Date', 'Rank', 'Factor'}.issubset(df.columns):
+        if not {'Date', 'Rank', 'Factor', 'Score'}.issubset(df.columns):
+            print(f"Warning: Sheet '{sheet}' is missing required columns (Date, Rank, Factor, Score).")
             return None
+        df['Date'] = pd.to_datetime(df['Date'])
         return df
-    except Exception:
+    except Exception as e:
+        print(f"Warning: Could not read or process sheet '{sheet}'. Error: {e}")
         return None
+
+
+def calculate_rank_correlation(p_model: pd.DataFrame, p_raw: pd.DataFrame) -> Optional[pd.Series]:
+    """Calculates monthly Spearman rank correlation between Model and RawRank scores."""
+    if p_model is None or p_raw is None:
+        return None
+
+    # Merge the two prediction dataframes on Date and Factor
+    merged = pd.merge(
+        p_model[['Date', 'Factor', 'Score']],
+        p_raw[['Date', 'Factor', 'Score']],
+        on=['Date', 'Factor'],
+        suffixes=('_model', '_raw')
+    )
+
+    if merged.empty:
+        return None
+
+    # Group by date and calculate Spearman correlation
+    correlations = merged.groupby('Date').apply(
+        lambda g: g[['Score_model', 'Score_raw']].corr(method='spearman').iloc[0, 1]
+    )
+    correlations.name = 'Spearman_Correlation'
+    return correlations
 
 
 # ------------------------------ Main Pipeline ------------------------------
@@ -218,6 +245,9 @@ def main():
     p_model = read_predictions_sheet(in_xlsx, "Predictions")
     p_raw   = read_predictions_sheet(in_xlsx, "Predictions_RawRank")
     p_iso   = read_predictions_sheet(in_xlsx, "Predictions_Iso")
+
+    # Calculate rank correlation between model and raw T60 scores
+    rank_corr = calculate_rank_correlation(p_model, p_raw)
 
     # Build strategy objects
     strat_model = build_strategy("Model", r_model, p_model, args.switch_cost_bps)
@@ -343,6 +373,10 @@ def main():
         }).set_index("Date")
         roll_df.to_excel(w, sheet_name="Rolling12m")
 
+        # Correlation vs RawRank
+        if rank_corr is not None:
+            rank_corr.to_excel(w, sheet_name="Correlation_vs_RawRank", header=True)
+
         # Optional Net sheets
         if args.switch_cost_bps > 0 and strat_model.r_net is not None:
             equity_net_df = pd.DataFrame({
@@ -434,6 +468,16 @@ def main():
         plt.xlabel("Date"); plt.ylabel("Relative Outperformance")
         plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout()
         pdf.savefig(); plt.close()
+
+        # Model vs RawRank Score Correlation
+        if rank_corr is not None:
+            plt.figure(figsize=(10, 4))
+            rank_corr.plot(label='Monthly Spearman Corr', alpha=0.7, color='teal')
+            rank_corr.rolling(12).mean().plot(label='12m Rolling Avg', style='--', color='red')
+            plt.title("Model vs. RawRank Score Correlation (Spearman)")
+            plt.xlabel("Date"); plt.ylabel("Correlation")
+            plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout()
+            pdf.savefig(); plt.close()
 
         # Optional net-of-turnover curves
         if args.switch_cost_bps > 0 and strat_model.equity_net is not None:
