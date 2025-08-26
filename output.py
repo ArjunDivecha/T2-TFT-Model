@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FILE: run_set_ranker_perf.py
-LAST UPDATED: 2025-08-23
+FILE: output.py (F1_external version)
+LAST UPDATED: 2025-08-25
 
 PURPOSE
-- Read set_ranker_outputs.xlsx from the ranker pipeline
+- Read predictions_f1_external.xlsx from the external factor ranker pipeline
 - Build monthly portfolio return series for:
     • Model (from 'Metrics' sheet, AvgTop5)
     • RawRank baseline (from 'Metrics_RawRank', AvgTop5)
@@ -20,10 +20,10 @@ PURPOSE
     • PDF:   set_ranker_perf_plots.pdf (curves, drawdowns, rolling stats, turnover, excess)
 
 USAGE (defaults target your junk5 folder):
-python run_set_ranker_perf.py \
-  --in_xlsx "/Users/macbook2024/Dropbox/AAA Backup/A Working/junk5/set_ranker_outputs.xlsx" \
-  --out_xlsx "/Users/macbook2024/Dropbox/AAA Backup/A Working/junk5/set_ranker_perf.xlsx" \
-  --out_pdf  "/Users/macbook2024/Dropbox/AAA Backup/A Working/junk5/set_ranker_perf_plots.pdf" \
+python output.py \
+  --in_xlsx "/Users/macbook2024/Dropbox/AAA Backup/A Working/junk5/output_F1_external/predictions_f1_external.xlsx" \
+  --out_xlsx "/Users/macbook2024/Dropbox/AAA Backup/A Working/junk5/output_F1_external/set_ranker_perf_F1_external.xlsx" \
+  --out_pdf  "/Users/macbook2024/Dropbox/AAA Backup/A Working/junk5/output_F1_external/set_ranker_perf_plots_F1_external.pdf" \
   --baseline RawRank
 
 NOTES
@@ -217,9 +217,9 @@ def build_strategy(name: str,
 
 def main():
     ap = argparse.ArgumentParser(description="Compute performance, drawdowns, turnover, and plots from set_ranker_outputs.xlsx")
-    ap.add_argument("--in_xlsx", type=str, default="/Users/macbook2024/Dropbox/AAA Backup/A Working/junk5/set_ranker_outputs.xlsx")
-    ap.add_argument("--out_xlsx", type=str, default="/Users/macbook2024/Dropbox/AAA Backup/A Working/junk5/set_ranker_perf.xlsx")
-    ap.add_argument("--out_pdf",  type=str, default="/Users/macbook2024/Dropbox/AAA Backup/A Working/junk5/set_ranker_perf_plots.pdf")
+    ap.add_argument("--in_xlsx", type=str, default="/Users/macbook2024/Dropbox/AAA Backup/A Working/junk5/output_F1_external/predictions_f1_external.xlsx")
+    ap.add_argument("--out_xlsx", type=str, default="/Users/macbook2024/Dropbox/AAA Backup/A Working/junk5/output_F1_external/set_ranker_perf_F1_external.xlsx")
+    ap.add_argument("--out_pdf",  type=str, default="/Users/macbook2024/Dropbox/AAA Backup/A Working/junk5/output_F1_external/set_ranker_perf_plots_F1_external.pdf")
     ap.add_argument("--baseline", type=str, default="RawRank", choices=["RawRank", "Iso", "Model"],
                     help="Baseline to compute excess vs. (default RawRank ≈ Top5Trailing60 if T60 are trailing-60 means)")
     ap.add_argument("--switch_cost_bps", type=float, default=0.0,

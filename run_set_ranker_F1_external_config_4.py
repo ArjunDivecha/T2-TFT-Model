@@ -1,28 +1,34 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FILE: run_set_ranker.py
-LAST UPDATED: 2025-08-23
+FILE: run_set_ranker_F1_external.py
+LAST UPDATED: 2025-08-25
 
 INPUT FILES (full paths):
 - /Users/macbook2024/Dropbox/AAA Backup/A Working/junk5/T60.xlsx (sheet: T60) → month-t forecasts
 - /Users/macbook2024/Dropbox/AAA Backup/A Working/junk5/T2_Optimizer.xlsx (sheet: Monthly_Net_Returns) → month-(t+1) realized returns
+- /Users/macbook2024/Dropbox/AAA Backup/A Working/junk5/Extrernal Data.xlsx (sheet: 1MTR) → external market factors
 
 OUTPUT FILES:
-- Excel: set_ranker_outputs.xlsx (Predictions, Metrics, Metrics_Aggregate, Completeness sheets + baseline sheets)
-- PDF:   set_ranker_plots.pdf (NDCG@5, Regret@5 time series with baseline overlays)
+- Excel: predictions_f1_external.xlsx (Predictions, Metrics, Metrics_Aggregate, Completeness sheets + baseline sheets)
+- PDF:   performance_f1_external.pdf (NDCG@5, Regret@5 time series with baseline overlays)
 - Models: models/model_month_XXX.pt (trained model states, metrics, hyperparams for each OOS month, if --save_models)
 
 RULES & HANDLING:
-- Alignment: use T60[t] to predict T2[t+1]
+- Alignment: T60 forecasts are already lagged - T60[t] predicts T2[t] (direct alignment)
 - Factors: include both _CS and _TS as separate columns
+- External factors: 9 market indicators from Extrernal Data.xlsx (1MTR, 3MTR, 12MTR, Bond Yield Change, Advance Decline, Dollar Index, GDP Growth, Inflation, VIX)
 - Missing forecasts at t → fill with month-t cross-sectional mean (logged)
+- Missing external data → forward-fill + trailing mean imputation
 - Missing labels at t+1 → excluded from loss/metrics (logged)
 - No winsorization (per user). Plots use matplotlib (no seaborn). Outputs xlsx/pdf. Meters included.
 
 MODEL:
 - Per-factor history K=24 months: features per month = [forecast, zscore_t, rank_pct_t, realized_prev]
-- Temporal encoder: 2-layer GRU (hidden=64)
+- External context history K=24 months: 9 external market factors
+- Factor temporal encoder: 2-layer GRU (hidden=64)
+- External context encoder: 1-layer GRU (hidden=32)
+- Combined features: factor_emb (64) + external_context (32) = 96
 - Cross-sectional SetTransformer block (self-attention) + MLP scorer
 - Loss: LambdaRank targeting NDCG@5 (rank-based relevance)
 - Validation: walk-forward (warmup=24), retrain each OOS step; early stop on val NDCG@5
@@ -72,16 +78,19 @@ def load_saved_model(model_path: str, device: torch.device):
     Load a saved model from disk for backtesting or analysis.
     
     Returns:
-        model: Loaded TemporalSetRanker model
+        model: Loaded SetRankerWithExternal model
         info: Dictionary with metadata (month, date, metrics, hyperparams, etc.)
     """
     info = torch.load(model_path, map_location=device)
     
     # Reconstruct model from saved hyperparams
     hp = info['hyperparams']
-    model = TemporalSetRanker(
+    f_ext = hp.get('f_ext', 0)  # Default to 0 for backward compatibility
+    
+    model = SetRankerWithExternal(
         n_factors=hp['n_factors'],
-        input_size=4,
+        input_size=hp.get('input_size', 4),
+        f_ext=f_ext,
         k_history=hp['k_history'],
         gru_hidden=hp['gru_hidden'],
         n_heads=hp['n_heads'],
@@ -100,16 +109,17 @@ def load_saved_model(model_path: str, device: torch.device):
 # ---------------- Data ----------------
 
 class DataBundle:
-    def __init__(self, dates, factor_names, features, labels_next, label_mask, fill_logs):
+    def __init__(self, dates, factor_names, features, labels_next, label_mask, fill_logs, external_features=None):
         self.dates = dates                    # List[pd.Timestamp]
         self.factor_names = factor_names      # List[str]
         self.features = features              # [T, M, F_in] float32
         self.labels_next = labels_next        # [T, M] float32
         self.label_mask = label_mask          # [T, M] bool
         self.fill_logs = fill_logs            # List[dict]
+        self.external_features = external_features  # [T, F_ext] float32 or None
 
 
-def read_sheets(t60_path: str, t2_path: str, s_t60: str = "T60", s_t2: str = "Monthly_Net_Returns"):
+def read_sheets(t60_path: str, t2_path: str, ext_path: str = None, s_t60: str = "T60", s_t2: str = "Monthly_Net_Returns", s_ext: str = "1MTR"):
     t60 = pd.read_excel(t60_path, sheet_name=s_t60)
     t2 = pd.read_excel(t2_path, sheet_name=s_t2)
     t60.columns = [str(c).strip() for c in t60.columns]
@@ -120,10 +130,37 @@ def read_sheets(t60_path: str, t2_path: str, s_t60: str = "T60", s_t2: str = "Mo
     t2['Date'] = pd.to_datetime(t2['Date'])
     t60 = t60.sort_values('Date').reset_index(drop=True)
     t2 = t2.sort_values('Date').reset_index(drop=True)
-    return t60, t2
+    
+    ext = None
+    if ext_path is not None:
+        try:
+            ext = pd.read_excel(ext_path, sheet_name=s_ext)
+            ext.columns = [str(c).strip() for c in ext.columns]
+            
+            # Handle case where date column might be named 'Country' instead of 'Date'
+            date_col = None
+            if 'Date' in ext.columns:
+                date_col = 'Date'
+            elif 'Country' in ext.columns:
+                date_col = 'Country'
+                ext = ext.rename(columns={'Country': 'Date'})
+                print("Renamed 'Country' column to 'Date' in external data")
+            
+            if date_col is None:
+                print(f"Warning: External data sheet '{s_ext}' missing 'Date' or 'Country' column. External factors disabled.")
+                ext = None
+            else:
+                ext['Date'] = pd.to_datetime(ext['Date'])
+                ext = ext.sort_values('Date').reset_index(drop=True)
+                print(f"Loaded external data with {len(ext)} rows and {len(ext.columns)-1} factors")
+        except Exception as e:
+            print(f"Warning: Could not load external data from {ext_path}: {e}. External factors disabled.")
+            ext = None
+    
+    return t60, t2, ext
 
 
-def build_dataset(t60: pd.DataFrame, t2: pd.DataFrame, include_cols: Optional[List[str]] = None) -> DataBundle:
+def build_dataset_with_external(t60: pd.DataFrame, t2: pd.DataFrame, ext: pd.DataFrame = None, include_cols: Optional[List[str]] = None) -> DataBundle:
     fac_t60 = [c for c in t60.columns if c != 'Date']
     fac_t2 = [c for c in t2.columns if c != 'Date']
     if include_cols is None:
@@ -175,13 +212,78 @@ def build_dataset(t60: pd.DataFrame, t2: pd.DataFrame, include_cols: Optional[Li
                 fill_logs.append({'Date': dates[t_idx], 'Factor': factors[j], 'Action': 'label_missing_excluded', 'FillValue': None})
 
     features = np.stack([F_f, z, rank_pct, realized_prev], axis=2).astype(np.float32)
-    return DataBundle(dates, factors, features, Y.astype(np.float32), label_mask.astype(bool), fill_logs)
+    
+    # Handle external factors
+    external_features = None
+    if ext is not None:
+        # Expected external columns (from plan) - handle column name variations
+        ext_cols_map = {
+            '1MTR': ['1MTR', '!MTR'],  # Handle potential typo in column name
+            '3MTR': ['3MTR', '#MTR'],  # Handle potential typo in column name
+            '12MTR': ['12MTR'],
+            'Bond Yield Change': ['Bond Yield Change'],
+            'Advance Decline': ['Advance Decline'],
+            'Dollar Index': ['Dollar Index'],
+            'GDP Growth': ['GDP Growth'],
+            'Inflation': ['Inflation'],
+            'VIX': ['VIX', 'Vix']  # Handle case variations
+        }
+        
+        # Map actual column names to standard names
+        available_ext_cols = []
+        col_mapping = {}
+        for standard_name, possible_names in ext_cols_map.items():
+            for possible_name in possible_names:
+                if possible_name in ext.columns:
+                    available_ext_cols.append(standard_name)
+                    col_mapping[possible_name] = standard_name
+                    break
+        
+        # Rename columns to standard names
+        if col_mapping:
+            ext = ext.rename(columns=col_mapping)
+        
+        if available_ext_cols:
+            print(f"Using external factors: {available_ext_cols}")
+            # Merge external data with main timeline
+            ext_merged = pd.merge(pd.DataFrame({'Date': dates}), ext[['Date'] + available_ext_cols], on='Date', how='left')
+            ext_data = ext_merged[available_ext_cols].to_numpy(float)  # [T, F_ext]
+            
+            # Handle missing external data with forward-fill + mean imputation
+            for j, col in enumerate(available_ext_cols):
+                col_data = ext_data[:, j]
+                # Forward fill
+                mask = ~np.isnan(col_data)
+                if mask.any():
+                    # Forward fill using pandas method
+                    filled_series = pd.Series(col_data).fillna(method='ffill')
+                    # Backward fill for any remaining NaNs at the start
+                    filled_series = filled_series.fillna(method='bfill')
+                    # If still NaN, use overall mean
+                    if filled_series.isna().any():
+                        overall_mean = filled_series.mean()
+                        filled_series = filled_series.fillna(overall_mean)
+                        for t_idx in range(T):
+                            if np.isnan(col_data[t_idx]):
+                                fill_logs.append({'Date': dates[t_idx], 'Factor': f'External_{col}', 'Action': 'external_fill_mean', 'FillValue': float(overall_mean)})
+                    ext_data[:, j] = filled_series.values
+                else:
+                    # All NaN - fill with 0
+                    ext_data[:, j] = 0.0
+                    for t_idx in range(T):
+                        fill_logs.append({'Date': dates[t_idx], 'Factor': f'External_{col}', 'Action': 'external_fill_zero', 'FillValue': 0.0})
+            
+            external_features = ext_data.astype(np.float32)
+        else:
+            print("Warning: No expected external factor columns found in external data")
+    
+    return DataBundle(dates, factors, features, Y.astype(np.float32), label_mask.astype(bool), fill_logs, external_features)
 
 
 # ---------------- Model ----------------
 
 class TemporalEncoderGRU(nn.Module):
-    def __init__(self, input_size=4, hidden_size=64, num_layers=2, dropout=0.1):
+    def __init__(self, input_size=3, hidden_size=64, num_layers=2, dropout=0.1):
         super().__init__()
         self.gru = nn.GRU(input_size, hidden_size, num_layers=num_layers, dropout=dropout if num_layers > 1 else 0.0, batch_first=True)
     def forward(self, x_seq):  # x_seq: [B*N, K, F]
@@ -193,12 +295,7 @@ class SetAttentionBlock(nn.Module):
         super().__init__()
         self.mha = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=False)
         self.ln1 = nn.LayerNorm(d_model)
-        self.ff = nn.Sequential(
-            nn.Linear(d_model, d_model * 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model * 2, d_model)
-        )
+        self.ff = nn.Sequential(nn.Linear(d_model, d_model * 2), nn.ReLU(), nn.Dropout(dropout), nn.Linear(d_model * 2, d_model))
         self.ln2 = nn.LayerNorm(d_model)
     def forward(self, tokens):  # [B, N, D]
         B, N, D = tokens.shape
@@ -209,22 +306,59 @@ class SetAttentionBlock(nn.Module):
         z2 = self.ff(z)
         return self.ln2(z + z2)
 
-class TemporalSetRanker(nn.Module):
-    def __init__(self, n_factors: int, input_size=4, k_history=24, gru_hidden=64, n_heads=4, d_model=64, emb_dim=32, dropout=0.1):
+class SetRankerWithExternal(nn.Module):
+    def __init__(self, n_factors: int, input_size=4, f_ext=9, k_history=24, gru_hidden=64, n_heads=4, d_model=64, emb_dim=32, dropout=0.1, ext_hidden_ratio=0.5, ext_layers=1, factor_layers=2):
         super().__init__()
         self.k_history = k_history
-        self.temporal = TemporalEncoderGRU(input_size, gru_hidden, num_layers=2, dropout=dropout)
+        self.f_ext = f_ext
+        
+        # Factor temporal encoder (existing)
+        self.factor_gru = nn.GRU(input_size, gru_hidden, num_layers=factor_layers, dropout=dropout if factor_layers > 1 else 0.0, batch_first=True)
+        
+        # NEW: External context encoder
+        if f_ext > 0:
+            ext_hidden = int(gru_hidden * ext_hidden_ratio)
+            self.external_gru = nn.GRU(f_ext, ext_hidden, num_layers=ext_layers, dropout=dropout if ext_layers > 1 else 0.0, batch_first=True)
+            self.external_proj = nn.Linear(ext_hidden, ext_hidden)
+            # Combined features: factor_emb + external_context
+            combined_dim = gru_hidden + ext_hidden
+        else:
+            self.external_gru = None
+            self.external_proj = None
+            combined_dim = gru_hidden
+            
         self.factor_emb = nn.Embedding(n_factors, emb_dim)
-        self.proj = nn.Linear(gru_hidden + emb_dim, d_model)
+        self.proj = nn.Linear(combined_dim + emb_dim, d_model)
         self.set_block = SetAttentionBlock(d_model, n_heads, dropout)
         self.scorer = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(), nn.Dropout(dropout), nn.Linear(d_model, 1))
-    def forward(self, x_seq, factor_ids):  # x_seq: [B, N, K, F]
+        
+    def forward(self, x_seq, factor_ids, external_seq=None):  # x_seq: [B, N, K, F], external_seq: [B, K, F_ext]
         B, N, K, F_in = x_seq.shape
-        h = self.temporal(x_seq.reshape(B*N, K, F_in)).reshape(B, N, -1)
+        
+        # Process factor histories: [B, N, K, F_in] -> [B, N, gru_hidden]
+        h_factor = self.factor_gru(x_seq.reshape(B*N, K, F_in))[1][-1].reshape(B, N, -1)  # Take last hidden state
+        
+        # Process external history if available: [B, K, F_ext] -> [B, ext_hidden]
+        if external_seq is not None and self.external_gru is not None:
+            h_external = self.external_gru(external_seq)[1][-1]  # [B, ext_hidden]
+            h_external = self.external_proj(h_external)  # [B, ext_hidden]
+            # Broadcast external context to all factors: [B, ext_hidden] -> [B, N, ext_hidden]
+            h_external = h_external.unsqueeze(1).expand(B, N, -1)
+            # Concatenate factor and external features
+            h_combined = torch.cat([h_factor, h_external], dim=-1)  # [B, N, gru_hidden + ext_hidden]
+        else:
+            h_combined = h_factor  # [B, N, gru_hidden]
+            
+        # Add factor embeddings
         emb = self.factor_emb(factor_ids).unsqueeze(0).expand(B, N, -1)
-        tok = self.proj(torch.cat([h, emb], dim=-1))
+        tok = self.proj(torch.cat([h_combined, emb], dim=-1))
         tok = self.set_block(tok)
         return self.scorer(tok).squeeze(-1)  # [B, N]
+
+# Keep original class for compatibility
+class TemporalSetRanker(SetRankerWithExternal):
+    def __init__(self, n_factors: int, input_size=3, k_history=24, gru_hidden=64, n_heads=4, d_model=64, emb_dim=32, dropout=0.1):
+        super().__init__(n_factors, input_size, f_ext=0, k_history=k_history, gru_hidden=gru_hidden, n_heads=n_heads, d_model=d_model, emb_dim=emb_dim, dropout=dropout)
 
 
 # ---------------- Loss & Metrics ----------------
@@ -421,10 +555,10 @@ def predict_isotonic(model: Dict[str, np.ndarray], x0: np.ndarray) -> np.ndarray
 
 # ---------------- Train / Validate ----------------
 
-def batch_from_months(features: np.ndarray, labels_next: np.ndarray, label_mask: np.ndarray, months: List[int], k_history: int, device: torch.device):
+def batch_from_months_with_external(features: np.ndarray, labels_next: np.ndarray, label_mask: np.ndarray, external_features: Optional[np.ndarray], months: List[int], k_history: int, device: torch.device):
     if not months:
-        return None, None, None
-    X_list=[]; Y_list=[]; M_list=[]
+        return None, None, None, None
+    X_list=[]; Y_list=[]; M_list=[]; E_list=[]
     for t in months:
         start = t - k_history + 1
         if start < 0:
@@ -432,25 +566,40 @@ def batch_from_months(features: np.ndarray, labels_next: np.ndarray, label_mask:
         X_list.append(features[start:t+1])  # [K, N, F]
         Y_list.append(labels_next[t])
         M_list.append(label_mask[t])
+        if external_features is not None:
+            E_list.append(external_features[start:t+1])  # [K, F_ext]
+        else:
+            E_list.append(None)
     if not X_list:
-        return None, None, None
+        return None, None, None, None
     X = np.stack(X_list, axis=0)             # [B, K, N, F]
     X = np.transpose(X, (0, 2, 1, 3))        # [B, N, K, F]
     Y = np.stack(Y_list, axis=0)
     M = np.stack(M_list, axis=0).astype(bool)
-    return torch.from_numpy(X).float().to(device), torch.from_numpy(Y).float().to(device), torch.from_numpy(M).to(device)
+    
+    E = None
+    if external_features is not None and E_list[0] is not None:
+        E = np.stack(E_list, axis=0)         # [B, K, F_ext]
+        E = torch.from_numpy(E).float().to(device)
+    
+    return torch.from_numpy(X).float().to(device), torch.from_numpy(Y).float().to(device), torch.from_numpy(M).to(device), E
+
+# Keep original function for compatibility
+def batch_from_months(features: np.ndarray, labels_next: np.ndarray, label_mask: np.ndarray, months: List[int], k_history: int, device: torch.device):
+    X, Y, M, _ = batch_from_months_with_external(features, labels_next, label_mask, None, months, k_history, device)
+    return X, Y, M
 
 
-def train_oos(model: nn.Module, device: torch.device, features, labels_next, label_mask,
+def train_oos_with_external(model: nn.Module, device: torch.device, features, labels_next, label_mask, external_features: Optional[np.ndarray],
               factor_ids: torch.Tensor, train_months: List[int], val_months: List[int], test_month: int,
               k_history: int, lr=1e-3, weight_decay=1e-3, epochs=50, patience=5, topk_loss=5, verbose=True,
               name_ranks: Optional[np.ndarray] = None, val_every: int = 1):
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     best_ndcg = -np.inf; no_improve=0; best_state=None
 
-    Xtr, Ytr, Mtr = batch_from_months(features, labels_next, label_mask, train_months, k_history, device)
-    Xval, Yval, Mval = batch_from_months(features, labels_next, label_mask, val_months, k_history, device)
-    Xte, Yte, Mte = batch_from_months(features, labels_next, label_mask, [test_month], k_history, device)
+    Xtr, Ytr, Mtr, Etr = batch_from_months_with_external(features, labels_next, label_mask, external_features, train_months, k_history, device)
+    Xval, Yval, Mval, Eval = batch_from_months_with_external(features, labels_next, label_mask, external_features, val_months, k_history, device)
+    Xte, Yte, Mte, Ete = batch_from_months_with_external(features, labels_next, label_mask, external_features, [test_month], k_history, device)
 
     if Xtr is None or Xte is None:
         return np.zeros(labels_next.shape[1], dtype=float), {'P@5': np.nan, 'NDCG@5': np.nan, 'AvgTop5': np.nan, 'Regret@5': np.nan, 'IC': np.nan}
@@ -459,7 +608,7 @@ def train_oos(model: nn.Module, device: torch.device, features, labels_next, lab
     for epoch in range(epochs):
         model.train()
         opt.zero_grad()
-        scores = model(Xtr, factor_ids)
+        scores = model(Xtr, factor_ids, Etr)
         loss = lambda_rank_loss(scores, Ytr, Mtr, topk_loss)
         loss.backward()
         opt.step()
@@ -469,7 +618,7 @@ def train_oos(model: nn.Module, device: torch.device, features, labels_next, lab
             if Xval is not None:
                 model.eval()
                 with torch.no_grad():
-                    val_scores = model(Xval, factor_ids)
+                    val_scores = model(Xval, factor_ids, Eval)
                     val_met = monthly_metrics(val_scores[0].cpu().numpy(), Yval[0].cpu().numpy(), Mval[0].cpu().numpy(), k=5, name_ranks=name_ranks)
                     val_ndcg = val_met['NDCG@5']
 
@@ -501,7 +650,7 @@ def train_oos(model: nn.Module, device: torch.device, features, labels_next, lab
 
     model.eval()
     with torch.no_grad():
-        s_test = model(Xte, factor_ids)[0].cpu().numpy()
+        s_test = model(Xte, factor_ids, Ete)[0].cpu().numpy()
     met = monthly_metrics(s_test, Yte.cpu().numpy()[0], Mte.cpu().numpy()[0], k=topk_loss, name_ranks=name_ranks)
     return s_test, met
 
@@ -537,6 +686,22 @@ def write_outputs_xlsx(out_path: str, dates: List[pd.Timestamp], factor_names: L
         agg['Mean_'+k]=float(np.mean(vals)) if vals else np.nan
     agg_df=pd.DataFrame([agg])
 
+    # Create wide-format scores and ranks
+    all_factor_data = []
+    for t_idx, scores in enumerate(all_scores):
+        if scores is None:
+            continue
+        s = scores
+        order_names = np.argsort(np.asarray(factor_names, dtype='U'))
+        name_ranks = np.empty(len(factor_names), dtype=int); name_ranks[order_names] = np.arange(len(factor_names))
+        ranks = pd.Series(s).rank(method='first', ascending=False).astype(int)
+        for j, factor in enumerate(factor_names):
+            all_factor_data.append({'Date': dates[t_idx], 'Factor': factor, 'Score': s[j], 'Rank': ranks[j]})
+    
+    all_factor_df = pd.DataFrame(all_factor_data)
+    scores_wide_df = all_factor_df.pivot(index='Date', columns='Factor', values='Score')
+    ranks_wide_df = all_factor_df.pivot(index='Date', columns='Factor', values='Rank')
+
     comp_df = pd.DataFrame(fill_logs)
     # Helper to build preds/mets/agg for a scores+metrics pair
     def _build_frames(all_scores_x, all_metrics_x, sheet_prefix: str):
@@ -568,6 +733,8 @@ def write_outputs_xlsx(out_path: str, dates: List[pd.Timestamp], factor_names: L
             preds_df.to_excel(w, index=False, sheet_name='Predictions')
             mets_df.to_excel(w, index=False, sheet_name='Metrics')
             agg_df.to_excel(w, index=False, sheet_name='Metrics_Aggregate')
+            scores_wide_df.to_excel(w, sheet_name='Scores_Wide')
+            ranks_wide_df.to_excel(w, sheet_name='Ranks_Wide')
             comp_df.to_excel(w, index=False, sheet_name='Completeness')
             if baseline_raw is not None:
                 preds_r, mets_r, agg_r = _build_frames(baseline_raw[0], baseline_raw[1], 'RawRank')
@@ -629,14 +796,16 @@ def write_plots_pdf(out_path: str, dates: List[pd.Timestamp], all_metrics: List[
 # ---------------- Main ----------------
 
 def main():
-    ap = argparse.ArgumentParser(description='Temporal SetRanker (LambdaRank@5) for monthly factor selection')
+    ap = argparse.ArgumentParser(description='SetRanker with External Factors (LambdaRank@5) for monthly factor selection')
     ap.add_argument('--t60', type=str, default='/Users/macbook2024/Dropbox/AAA Backup/A Working/junk5/T60.xlsx')
     ap.add_argument('--t2', type=str, default='/Users/macbook2024/Dropbox/AAA Backup/A Working/junk5/T2_Optimizer.xlsx')
+    ap.add_argument('--ext', type=str, default='/Users/macbook2024/Dropbox/AAA Backup/A Working/junk5/Extrernal Data.xlsx', help='External factors data file')
     ap.add_argument('--sheet_t60', type=str, default='T60')
     ap.add_argument('--sheet_t2', type=str, default='Monthly_Net_Returns')
-    ap.add_argument('--output_dir', type=str, default='output_F2', help='Directory to save all outputs (predictions, plots, models).')
-    ap.add_argument('--out_xlsx', type=str, default='predictions_f2.xlsx', help='Output Excel file name (relative to output_dir).')
-    ap.add_argument('--out_pdf', type=str, default='performance_f2.pdf', help='Output PDF file name (relative to output_dir).')
+    ap.add_argument('--sheet_ext', type=str, default='1MTR', help='External factors sheet name')
+    ap.add_argument('--output_dir', type=str, default='output_F1_external_config_4', help='Directory to save all outputs (predictions, plots, models).')
+    ap.add_argument('--out_xlsx', type=str, default='predictions_f1_external_config_4.xlsx', help='Output Excel file name (relative to output_dir).')
+    ap.add_argument('--out_pdf', type=str, default='performance_f1_external_config_4.pdf', help='Output PDF file name (relative to output_dir).')
     ap.add_argument('--k_history', type=int, default=24)
     ap.add_argument('--warmup', type=int, default=24)
     ap.add_argument('--epochs', type=int, default=60)
@@ -646,6 +815,7 @@ def main():
     ap.add_argument('--heads', type=int, default=4)
     ap.add_argument('--hidden', type=int, default=64)
     ap.add_argument('--emb_dim', type=int, default=32)
+    ap.add_argument('--dropout', type=float, default=0.1)
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--verbose', action='store_true')
     ap.add_argument('--max_oos', type=int, default=0)
@@ -666,12 +836,12 @@ def main():
     print(f"Device: {device}")
 
     print('[1/5] Reading Excel...')
-    t60, t2 = read_sheets(args.t60, args.t2, args.sheet_t60, args.sheet_t2)
+    t60, t2, ext = read_sheets(args.t60, args.t2, args.ext, args.sheet_t60, args.sheet_t2, args.sheet_ext)
     factors = [c for c in t60.columns if c != 'Date' and c in t2.columns]
     print(f"Found {len(factors)} common factors")
 
-    print('[2/5] Building dataset...')
-    data = build_dataset(t60, t2)
+    print('[2/5] Building dataset with external factors...')
+    data = build_dataset_with_external(t60, t2, ext)
 
     # Walk-forward setup
     T, M, F_in = data.features.shape
@@ -719,8 +889,10 @@ def main():
             train_months = eligible[:-val_span_eff] if val_span_eff > 0 else eligible
             val_months = eligible[-val_span_eff:] if val_span_eff > 0 else []
 
-        # S2: Create model and optionally warm-start from previous month
-        model = TemporalSetRanker(n_factors=M, input_size=4, k_history=k_hist, gru_hidden=args.hidden, n_heads=args.heads, d_model=args.hidden, emb_dim=args.emb_dim, dropout=0.1).to(device)
+        # S2: Create model with external factors and optionally warm-start from previous month
+        f_ext = data.external_features.shape[1] if data.external_features is not None else 0
+        model = SetRankerWithExternal(n_factors=M, input_size=4, f_ext=f_ext, k_history=k_hist, gru_hidden=args.hidden, n_heads=args.heads, d_model=args.hidden, emb_dim=args.emb_dim, dropout=0.1).to(device)
+        print(f"Model created with {f_ext} external factors")
         
         # Warm-start: load previous month's weights if available
         if args.warm_start and prev_model_state is not None:
@@ -732,7 +904,7 @@ def main():
             # First month or no warm-start: use full epochs
             epochs_to_use = args.epochs
             
-        scores, metrics = train_oos(model, device, data.features, data.labels_next, data.label_mask, factor_ids, train_months, val_months, test_t, k_hist, lr=args.lr, weight_decay=args.weight_decay, epochs=epochs_to_use, patience=args.patience, topk_loss=5, verbose=args.verbose, name_ranks=name_ranks, val_every=args.val_every)
+        scores, metrics = train_oos_with_external(model, device, data.features, data.labels_next, data.label_mask, data.external_features, factor_ids, train_months, val_months, test_t, k_hist, lr=args.lr, weight_decay=args.weight_decay, epochs=epochs_to_use, patience=args.patience, topk_loss=5, verbose=args.verbose, name_ranks=name_ranks, val_every=args.val_every)
         
         # S2: Save current model state for next month's warm-start
         if args.warm_start:
@@ -753,6 +925,7 @@ def main():
                 'hyperparams': {
                     'n_factors': M,
                     'input_size': 4,
+                    'f_ext': f_ext,
                     'k_history': k_hist,
                     'gru_hidden': args.hidden,
                     'n_heads': args.heads,
